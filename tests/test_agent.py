@@ -16,13 +16,14 @@ from datetime import datetime
 from pathlib import Path
 from unittest import TestCase
 from unittest.mock import MagicMock, call, patch
+from urllib.parse import urlparse, parse_qs
 
 from cryptography.fernet import Fernet
 
 import agent
 import executors
 import platform_detect
-from agent import Agent
+from agent import Agent, batch_list
 
 from . import util
 
@@ -79,7 +80,6 @@ class TestAgentIdentity(TestCase):
             agent_instance = Agent(self.config)
 
             self.assertIsNone(agent_instance.identity)
-
 
 
 class TestAgent(TestCase):
@@ -179,20 +179,40 @@ class TestAgent(TestCase):
         token1 = crypto.encrypt(b'{"instruction": "echo foo"}').decode('utf-8')
         token2 = crypto.encrypt(b'{"instruction": "echo bar"}').decode('utf-8')
 
-        instructions = [{'instruction': token1}, {'instruction': token2}]
+        instructions = [{'id': '1', 'instruction': token1}, {'id': '2', 'instruction': token2}]
         res = self.agent.decrypt_instructions(instructions, '123-456')
-        self.assertListEqual(res, [{'instruction': 'echo foo'}, {'instruction': 'echo bar'}])
+        self.assertListEqual(
+            res, [{'id': '1', 'instruction': 'echo foo'}, {'id': '2', 'instruction': 'echo bar'}]
+        )
 
     @patch('requests.get')
     def test_get_instructions(self, mock_get):
+        # Set up v1 API URL like in test_init_redirect
+        self.config['AIR_API'] = 'http://localhost:8000/v1/'
         instructions = {'foo': 'bar'}
-        mock_get.json = MagicMock(return_value={'foo': 'encrypted'})
+        mock_get.return_value.status_code = 200
+        mock_get.return_value.json.return_value = {'results': [{'foo': 'encrypted'}]}
         self.mock_id.return_value = '000-000'
+        self.agent.get_key = MagicMock(return_value='test-key')
         self.agent.decrypt_instructions = MagicMock(return_value=instructions)
         res = self.agent.get_instructions()
         self.assertEqual(res, instructions)
-        url = self.config['AIR_API'] + 'simulation-node/000-000/instructions/'
-        mock_get.assert_called_with(url, timeout=10, verify=self.agent.verify_ssl)
+
+        # Verify the get request was made
+        mock_get.assert_called_once()
+        actual_url = mock_get.call_args[0][0]
+
+        # Parse the URL to check components separately
+        parsed_url = urlparse(actual_url)
+
+        # Check the base URL and path
+        self.assertEqual(parsed_url.netloc, 'localhost:8000')
+        self.assertEqual(parsed_url.path, '/api/v2/simulations/nodes/000-000/instructions/')
+
+        # Check query parameters
+        query_params = parse_qs(parsed_url.query)
+        self.assertEqual(query_params['agent_key'], ['test-key'])
+        self.assertEqual(query_params['limit'], ['1000'])
 
     @patch('requests.get', side_effect=Exception)
     @patch('logging.error')
@@ -212,16 +232,46 @@ class TestAgent(TestCase):
         mock_exception.assert_called_with('No identity')
 
     @patch('requests.delete')
-    def test_delete_instructions(self, mock_delete):
-        url = self.config['AIR_API'] + f'simulation-node/{self.agent.identity}/instructions/'
-        self.agent.delete_instructions()
-        mock_delete.assert_called_with(url, verify=self.agent.verify_ssl)
+    @patch('logging.info')
+    def test_delete_instructions(self, mock_log, mock_delete):
+        # Set up v1 API URL like in test_init_redirect
+        self.config['AIR_API'] = 'http://localhost:8000/v1/'
+        mock_delete.return_value.status_code = 204
+        instruction_ids = ['uuid1', 'uuid2', 'uuid3']
+        self.agent.get_key = MagicMock(return_value='test-key')
+
+        self.agent.delete_instructions(instruction_ids)
+
+        # Verify the delete request was made
+        mock_delete.assert_called_once()
+        actual_url = mock_delete.call_args[0][0]
+
+        # Parse the URL to check components separately
+        parsed_url = urlparse(actual_url)
+
+        # Check the base URL and path
+        self.assertEqual(parsed_url.netloc, 'localhost:8000')
+        self.assertEqual(
+            parsed_url.path, f'/api/v2/simulations/nodes/{self.agent.identity}/instructions/bulk-delete/'
+        )
+
+        # Check query parameters
+        query_params = parse_qs(parsed_url.query)
+        self.assertEqual(query_params['agent_key'], ['test-key'])
+
+        # Check that all instruction IDs are present in the query
+        actual_ids = query_params['ids'][0].split(',')
+        self.assertEqual(set(actual_ids), set(instruction_ids))
+
+        mock_log.assert_called_with('Successfully deleted 3 instructions')
 
     @patch('requests.delete', side_effect=Exception)
     @patch('logging.error')
     def test_delete_instructions_failed(self, mock_log, mock_delete):
-        self.agent.delete_instructions()
-        mock_log.assert_called_with('Failed to delete post-clone instructions')
+        instruction_ids = ['uuid1', 'uuid2']
+        self.agent.get_key = MagicMock(return_value='test-key')
+        self.agent.delete_instructions(instruction_ids)
+        mock_log.assert_called_with('Failed to delete batch: ')
 
     @patch('builtins.open')
     @patch('agent.parse_instructions', return_value=True)
@@ -450,9 +500,20 @@ class TestAgent(TestCase):
     @patch('shutil.move')
     @patch('os.execv')
     @patch('agent.parse_instructions')
+    @patch('logging.error')
     @patch('agent.fix_clock')
     def test_auto_update_rm_safe(
-        self, mock_fix, mock_parse, mock_exec, mock_move, mock_ls, mock_cwd, mock_clone, mock_rm, mock_get
+        self,
+        mock_fix,
+        mock_log,
+        mock_parse,
+        mock_exec,
+        mock_move,
+        mock_ls,
+        mock_cwd,
+        mock_clone,
+        mock_rm,
+        mock_get,
     ):
         mock_get.return_value.text = "AGENT_VERSION = '2.0.0'\n"
         testagent = Agent(self.config)
@@ -522,6 +583,145 @@ class TestAgent(TestCase):
         self.agent.unlock()
         self.assertFalse(self.agent.lock.locked())
 
+    @patch('requests.delete')
+    @patch('logging.info')
+    @patch('logging.debug')
+    def test_delete_instructions_batch_processing(self, mock_debug, mock_info, mock_delete):
+        """Test that delete_instructions properly handles batch processing"""
+        # Set up v1 API URL like in test_init_redirect
+        self.config['AIR_API'] = 'http://localhost:8000/v1/'
+        mock_delete.return_value.status_code = 204
+
+        # Create a list of 125 instruction IDs to test multiple batches
+        instruction_ids = [f'uuid{i}' for i in range(125)]
+        self.agent.get_key = MagicMock(return_value='test-key')
+
+        self.agent.delete_instructions(instruction_ids)
+
+        # Should make 3 calls: 50 + 50 + 25 (batch size is 50)
+        self.assertEqual(mock_delete.call_count, 3)
+
+        # Verify summary logging
+        mock_info.assert_called_with('Successfully deleted 125 instructions')
+
+        # Verify batch logging
+        mock_debug.assert_any_call(f'Deleting specific instructions: {instruction_ids}')
+        mock_debug.assert_any_call('Deleting batch of 50 instructions')
+        mock_debug.assert_any_call('Deleting batch of 25 instructions')
+
+    @patch('requests.delete')
+    @patch('logging.warning')
+    @patch('logging.info')
+    def test_delete_instructions_partial_failure(self, mock_info, mock_warning, mock_delete):
+        """Test handling of partial batch failures"""
+        self.config['AIR_API'] = 'http://localhost:8000/v1/'
+
+        # Mock different responses for different batches
+        def side_effect(*args, **kwargs):
+            mock_response = MagicMock()
+            if 'uuid0' in args[0]:  # First batch succeeds
+                mock_response.status_code = 204
+            else:  # Second batch fails
+                mock_response.status_code = 500
+            return mock_response
+
+        mock_delete.side_effect = side_effect
+
+        instruction_ids = [f'uuid{i}' for i in range(75)]  # 50 + 25 batches
+        self.agent.get_key = MagicMock(return_value='test-key')
+
+        self.agent.delete_instructions(instruction_ids)
+
+        # Should make 2 calls
+        self.assertEqual(mock_delete.call_count, 2)
+
+        # Verify summary logging shows partial success
+        mock_info.assert_called_with('Successfully deleted 50 instructions')
+        mock_warning.assert_called_with('Failed to delete 25 instructions')
+
+    @patch('requests.delete')
+    @patch('logging.error')
+    def test_delete_instructions_no_agent_key(self, mock_error, mock_delete):
+        """Test handling when agent key is not available"""
+        instruction_ids = ['uuid1', 'uuid2']
+        self.agent.get_key = MagicMock(return_value=None)
+
+        self.agent.delete_instructions(instruction_ids)
+
+        mock_delete.assert_not_called()
+        mock_error.assert_called_with('No agent key found for deletion')
+
+    @patch('requests.delete')
+    def test_delete_instructions_empty_list(self, mock_delete):
+        """Test handling of empty instruction list"""
+        self.agent.delete_instructions([])
+        mock_delete.assert_not_called()
+
+
+class TestBatchList(TestCase):
+    """Test cases for the batch_list utility function"""
+
+    def test_batch_list_even_division(self):
+        """Test batching with evenly divisible list"""
+        items = list(range(10))
+        batches = list(batch_list(items, 5))
+        expected = [[0, 1, 2, 3, 4], [5, 6, 7, 8, 9]]
+        self.assertEqual(batches, expected)
+
+    def test_batch_list_uneven_division(self):
+        """Test batching with remainder"""
+        items = list(range(7))
+        batches = list(batch_list(items, 3))
+        expected = [[0, 1, 2], [3, 4, 5], [6]]
+        self.assertEqual(batches, expected)
+
+    def test_batch_list_single_item(self):
+        """Test batching with single item"""
+        items = ['single']
+        batches = list(batch_list(items, 5))
+        expected = [['single']]
+        self.assertEqual(batches, expected)
+
+    def test_batch_list_empty(self):
+        """Test batching with empty list"""
+        items = []
+        batches = list(batch_list(items, 5))
+        expected = []
+        self.assertEqual(batches, expected)
+
+    def test_batch_list_batch_size_larger_than_list(self):
+        """Test batching when batch size is larger than list size"""
+        items = [1, 2, 3]
+        batches = list(batch_list(items, 10))
+        expected = [[1, 2, 3]]
+        self.assertEqual(batches, expected)
+
+    def test_batch_list_batch_size_one(self):
+        """Test batching with batch size of 1"""
+        items = ['a', 'b', 'c']
+        batches = list(batch_list(items, 1))
+        expected = [['a'], ['b'], ['c']]
+        self.assertEqual(batches, expected)
+
+    def test_batch_list_memory_efficiency(self):
+        """Test that batch_list is memory efficient (generator)"""
+        items = list(range(1000))
+        batch_generator = batch_list(items, 100)
+
+        # Should be a generator, not a list
+        self.assertNotIsInstance(batch_generator, list)
+
+        # Should be able to iterate and get first batch
+        first_batch = next(batch_generator)
+        self.assertEqual(first_batch, list(range(100)))
+
+    def test_batch_list_string_items(self):
+        """Test batching with string items"""
+        items = ['uuid1', 'uuid2', 'uuid3', 'uuid4', 'uuid5']
+        batches = list(batch_list(items, 2))
+        expected = [['uuid1', 'uuid2'], ['uuid3', 'uuid4'], ['uuid5']]
+        self.assertEqual(batches, expected)
+
 
 class TestAgentFunctions(TestCase):
     class MockConfigParser(dict):
@@ -556,7 +756,8 @@ class TestAgentFunctions(TestCase):
     @patch('agent.executors')
     @patch('agent.sleep')
     @patch(
-        'agent.Agent.get_instructions', return_value=[{'data': 'foo', 'executor': 'shell', 'monitor': None}]
+        'agent.Agent.get_instructions',
+        return_value=[{'id': 'test-uuid-1', 'data': 'foo', 'executor': 'shell', 'monitor': None}],
     )
     @patch('threading.Thread')
     @patch('agent.Agent.auto_update')
@@ -599,7 +800,8 @@ class TestAgentFunctions(TestCase):
     @patch('agent.executors')
     @patch('agent.sleep')
     @patch(
-        'agent.Agent.get_instructions', return_value=[{'data': 'foo', 'executor': 'shell', 'monitor': None}]
+        'agent.Agent.get_instructions',
+        return_value=[{'id': 'test-uuid-2', 'data': 'foo', 'executor': 'shell', 'monitor': None}],
     )
     @patch('threading.Thread')
     @patch('agent.fix_clock')
@@ -620,8 +822,8 @@ class TestAgentFunctions(TestCase):
         mock_exec.EXECUTOR_MAP = {'shell': MagicMock(side_effect=[1, 2])}
         mock_agent = MagicMock()
         mock_agent.get_instructions.return_value = [
-            {'executor': 'shell', 'data': 'foo', 'monitor': None},
-            {'executor': 'shell', 'data': 'bar', 'monitor': None},
+            {'id': 'test-uuid-3', 'executor': 'shell', 'data': 'foo', 'monitor': None},
+            {'id': 'test-uuid-4', 'executor': 'shell', 'data': 'bar', 'monitor': None},
         ]
         mock_agent.delete_instructions = MagicMock()
         mock_agent.identity = 'xzy'
@@ -641,7 +843,9 @@ class TestAgentFunctions(TestCase):
     def test_parse_instructions_unsupported(self, mock_log, mock_exec):
         mock_exec.EXECUTOR_MAP = {'shell': MagicMock(side_effect=[1, 2])}
         mock_agent = MagicMock()
-        mock_agent.get_instructions.return_value = [{'executor': 'test', 'data': 'foo', 'monitor': None}]
+        mock_agent.get_instructions.return_value = [
+            {'id': 'test-uuid-5', 'executor': 'test', 'data': 'foo', 'monitor': None}
+        ]
         agent.parse_instructions(mock_agent)
         mock_log.assert_called_with('Received unsupported executor test')
 
@@ -676,17 +880,19 @@ class TestAgentFunctions(TestCase):
     def test_parse_instructions_cmd_failed(self, mock_sleep, mock_log, mock_exec):
         mock_exec.EXECUTOR_MAP = {'shell': MagicMock(side_effect=[False, False, True])}
         mock_agent = MagicMock()
-        mock_agent.get_instructions.return_value = [{'executor': 'shell', 'data': 'foo', 'monitor': None}]
+        mock_agent.get_instructions.return_value = [
+            {'id': 'test-uuid-6', 'executor': 'shell', 'data': 'foo', 'monitor': None}
+        ]
         mock_agent.get_identity = MagicMock(return_value='abc')
         agent.parse_instructions(mock_agent)
-        assert_logs = MagicMock()
-        assert_logs.warning(
-            'Failed to execute all instructions on attempt #1. ' + 'Retrying in 10 seconds...'
-        )
-        assert_logs.warning(
-            'Failed to execute all instructions on attempt #2. ' + 'Retrying in 20 seconds...'
-        )
-        self.assertEqual(mock_log.mock_calls, assert_logs.mock_calls)
+        # The new implementation logs individual instruction failures plus retry messages
+        expected_calls = [
+            call('Instruction 1 (ID: test-uuid-6) failed'),
+            call('Failed to execute all instructions on attempt #1. ' + 'Retrying in 10 seconds...'),
+            call('Instruction 1 (ID: test-uuid-6) failed'),
+            call('Failed to execute all instructions on attempt #2. ' + 'Retrying in 20 seconds...'),
+        ]
+        self.assertEqual(mock_log.call_args_list, expected_calls)
         assert_sleep = MagicMock()
         assert_sleep(10)
         assert_sleep(20)
@@ -701,7 +907,9 @@ class TestAgentFunctions(TestCase):
     def test_parse_instructions_all_cmd_failed(self, mock_sleep, mock_log, mock_exec):
         mock_exec.EXECUTOR_MAP = {'shell': MagicMock(return_value=False)}
         mock_agent = MagicMock()
-        mock_agent.get_instructions.return_value = [{'executor': 'shell', 'data': 'foo', 'monitor': None}]
+        mock_agent.get_instructions.return_value = [
+            {'id': 'test-uuid-7', 'executor': 'shell', 'data': 'foo', 'monitor': None}
+        ]
         mock_agent.get_identity = MagicMock(return_value='abc')
         agent.parse_instructions(mock_agent)
         assert_sleep = MagicMock()
@@ -723,7 +931,7 @@ class TestAgentFunctions(TestCase):
         mock_exec.EXECUTOR_MAP = {'shell': MagicMock(side_effect=[1, 2])}
         mock_agent = MagicMock()
         mock_agent.get_instructions.return_value = [
-            {'executor': 'shell', 'data': 'foo', 'monitor': monitor_str}
+            {'id': 'test-uuid-8', 'executor': 'shell', 'data': 'foo', 'monitor': monitor_str}
         ]
         mock_channel = MagicMock()
         agent.parse_instructions(mock_agent, channel=mock_channel)
@@ -751,11 +959,17 @@ class TestAgentFunctions(TestCase):
         mock_exec.EXECUTOR_MAP = {'init': MagicMock(side_effect=[1, 2])}
         mock_agent = MagicMock()
         mock_agent.get_instructions.return_value = [
-            {'executor': 'init', 'data': '{"hostname": "test"}', 'monitor': None}
+            {'id': 'test-uuid-9', 'executor': 'init', 'data': '{"hostname": "test"}', 'monitor': None}
         ]
         mock_agent.os = None
         agent.parse_instructions(mock_agent)
-        mock_log.assert_called_with('Skipping init instructions due to missing os')
+        # Verify both messages are logged in the correct order
+        mock_log.assert_has_calls(
+            [
+                call('Skipping init instructions due to missing os'),
+                call('No executable instructions in batch - nothing to do'),
+            ]
+        )
 
     @patch(
         'subprocess.check_output', return_value=b'ntp.service\nfoo.service\nntp@mgmt.service\nchrony.service'
@@ -976,6 +1190,119 @@ class TestAgentFunctions(TestCase):
     def test_get_key_directory_path_override(self):
         del self.config['KEY_DIR']
         self.assertEqual(agent.get_key_directory_path(self.config), Path('/mnt/air/'))
+
+    @patch('agent.executors')
+    @patch('agent.sleep')
+    def test_parse_instructions_partial_success_with_retry(self, mock_sleep, mock_exec):
+        """Test realistic scenario: successful instructions disappear after deletion"""
+        # First attempt: uuid-1 succeeds, uuid-2 fails, uuid-3 succeeds
+        # Second attempt: only uuid-2 remains and succeeds
+        mock_exec.EXECUTOR_MAP = {'shell': MagicMock(side_effect=[True, False, True, True])}
+        mock_agent = MagicMock()
+
+        # Mock get_instructions to return different results after deletions
+        mock_agent.get_instructions.side_effect = [
+            # First call: all 3 instructions
+            [
+                {'id': 'uuid-1', 'executor': 'shell', 'data': 'cmd1', 'monitor': None},
+                {'id': 'uuid-2', 'executor': 'shell', 'data': 'cmd2', 'monitor': None},
+                {'id': 'uuid-3', 'executor': 'shell', 'data': 'cmd3', 'monitor': None},
+            ],
+            # Second call (after uuid-1,uuid-3 deleted): only uuid-2 remains
+            [
+                {'id': 'uuid-2', 'executor': 'shell', 'data': 'cmd2', 'monitor': None},
+            ],
+        ]
+        mock_agent.get_identity = MagicMock(return_value='test-id')
+
+        result = agent.parse_instructions(mock_agent)
+
+        # Should succeed overall after retry
+        self.assertTrue(result)
+        # Should be called twice: once for first attempt, once for retry
+        self.assertEqual(mock_agent.delete_instructions.call_count, 2)
+
+        # Verify the exact order of deletion calls
+        expected_calls = [
+            call(['uuid-1', 'uuid-3']),  # First attempt: delete successful instructions
+            call(['uuid-2']),  # Retry: delete the previously failed instruction
+        ]
+        mock_agent.delete_instructions.assert_has_calls(expected_calls, any_order=False)
+        mock_agent.lock.acquire.assert_called()
+        mock_agent.unlock.assert_called()
+
+    @patch('agent.executors')
+    @patch('agent.sleep')
+    def test_parse_instructions_retry_failed_until_exhausted(self, mock_sleep, mock_exec):
+        """Test realistic scenario: successful instructions disappear, failed one persists"""
+        # First attempt: uuid-1 and uuid-3 succeed, uuid-2 fails
+        # Subsequent attempts: only uuid-2 (keeps failing)
+        mock_exec.EXECUTOR_MAP = {'shell': MagicMock(side_effect=[True, False, True, False, False, False])}
+        mock_agent = MagicMock()
+
+        # Mock get_instructions to simulate realistic behavior
+        mock_agent.get_instructions.side_effect = [
+            # First call: all 3 instructions
+            [
+                {'id': 'uuid-1', 'executor': 'shell', 'data': 'cmd1', 'monitor': None},
+                {'id': 'uuid-2', 'executor': 'shell', 'data': 'cmd2', 'monitor': None},
+                {'id': 'uuid-3', 'executor': 'shell', 'data': 'cmd3', 'monitor': None},
+            ],
+            # Subsequent calls: only uuid-2 remains (the failed one) - 3 more calls total
+            [{'id': 'uuid-2', 'executor': 'shell', 'data': 'cmd2', 'monitor': None}],
+            [{'id': 'uuid-2', 'executor': 'shell', 'data': 'cmd2', 'monitor': None}],
+            [{'id': 'uuid-2', 'executor': 'shell', 'data': 'cmd2', 'monitor': None}],
+        ]
+        mock_agent.get_identity = MagicMock(return_value='test-id')
+
+        result = agent.parse_instructions(mock_agent)
+
+        # Should return False since uuid-2 never succeeds
+        self.assertFalse(result)
+        # Should only delete once (successful instructions from first attempt)
+        mock_agent.delete_instructions.assert_called_once_with(['uuid-1', 'uuid-3'])
+        mock_agent.lock.acquire.assert_called()
+        mock_agent.unlock.assert_called()
+
+    @patch('agent.executors')
+    def test_parse_instructions_all_success_selective_deletion(self, mock_exec):
+        """Test that all successful instruction IDs are passed to delete_instructions"""
+        # All instructions succeed
+        mock_exec.EXECUTOR_MAP = {'shell': MagicMock(return_value=True)}
+        mock_agent = MagicMock()
+        mock_agent.get_instructions.return_value = [
+            {'id': 'uuid-success-1', 'executor': 'shell', 'data': 'cmd1', 'monitor': None},
+            {'id': 'uuid-success-2', 'executor': 'shell', 'data': 'cmd2', 'monitor': None},
+            {'id': 'uuid-success-3', 'executor': 'shell', 'data': 'cmd3', 'monitor': None},
+        ]
+        mock_agent.get_identity = MagicMock(return_value='test-id')
+
+        result = agent.parse_instructions(mock_agent)
+
+        # Should succeed and delete all successful instructions
+        self.assertTrue(result)
+        mock_agent.delete_instructions.assert_called_once_with(
+            ['uuid-success-1', 'uuid-success-2', 'uuid-success-3']
+        )
+
+    @patch('agent.executors')
+    @patch('agent.sleep')
+    def test_parse_instructions_no_successful_no_deletion(self, mock_sleep, mock_exec):
+        """Test that delete_instructions is not called when no instructions succeed"""
+        # All instructions fail
+        mock_exec.EXECUTOR_MAP = {'shell': MagicMock(return_value=False)}
+        mock_agent = MagicMock()
+        mock_agent.get_instructions.return_value = [
+            {'id': 'uuid-fail-1', 'executor': 'shell', 'data': 'cmd1', 'monitor': None},
+            {'id': 'uuid-fail-2', 'executor': 'shell', 'data': 'cmd2', 'monitor': None},
+        ]
+        mock_agent.get_identity = MagicMock(return_value='test-id')
+
+        result = agent.parse_instructions(mock_agent)
+
+        # Should fail and not delete anything
+        self.assertFalse(result)
+        mock_agent.delete_instructions.assert_not_called()
 
 
 class TestExecutors(TestCase):

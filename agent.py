@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 """
@@ -23,6 +23,9 @@ import typing
 from datetime import datetime, timedelta
 from pathlib import Path
 from time import sleep
+from urllib.parse import urlparse, urlencode
+from http import HTTPStatus
+from typing import Iterator, TypeVar, List
 
 import git
 import requests
@@ -39,6 +42,18 @@ KEY_DEVICE_FALLBACK_PATH_CONFIG_VAR = 'KEY_DEVICE'
 KEY_DEVICE_FALLBACK_PATH_DEFAULT = '/dev/vdb'
 KEY_DIR_CONFIG_VAR = 'KEY_DIR'
 KEY_DIR_DEFAULT = '/mnt/air/'
+LIMIT = 1000  # Temporary limit to 1000 instructions until NGC refactor
+BATCH_SIZE = 50
+
+T = TypeVar('T')
+
+
+def batch_list(list_to_batch: List[T], batch_size: int) -> Iterator[List[T]]:
+    """Batches a list, yielding individual batches, only keeping a single batch in memory at a time."""
+    return (
+        list_to_batch[batch_number : batch_number + batch_size]
+        for batch_number in range(0, len(list_to_batch), batch_size)
+    )
 
 
 class Agent:
@@ -148,14 +163,14 @@ class Agent:
 
     def decrypt_instructions(self, instructions, identity):
         """
-        Decrypts a set of instructions received from the Air API
+        Decrypts a set of instructions received from the Air API (V2 format)
 
         Arguments:
-        instructions (list) - A list of encrypted instructions received from the API
+        instructions (list) - A list of V2 encrypted instructions from API
         identity (str) - The VM's current UUID
 
         Returns:
-        list - A list of decrypted instructions
+        list - A list of decrypted instructions with V2 metadata of the instruction id
         """
         decrypted_instructions = []
         key = self.get_key(identity)
@@ -163,48 +178,121 @@ class Agent:
             logging.debug('Decrypting post-clone instructions')
             crypto = Fernet(key)
             for instruction in instructions:
-                clear_text = crypto.decrypt(bytes(instruction['instruction'], 'utf-8'))
-                decrypted_instructions.append(json.loads(clear_text))
+                try:
+                    clear_text = crypto.decrypt(bytes(instruction['instruction'], 'utf-8'))
+                    decrypted_content = json.loads(clear_text)
+                    if not isinstance(decrypted_content, dict):
+                        logging.warning(f'Decrypted instruction is not a dictionary: {clear_text} skipping')
+                        continue
+                    # Merge V2 ID with decrypted instruction data
+                    merged_instruction = {**decrypted_content, 'id': instruction['id']}
+                    decrypted_instructions.append(merged_instruction)
+                except Exception as e:
+                    logging.warning(f'Failed to decrypt instruction {instruction.get("id", "unknown")}: {e}')
+                    continue
         return decrypted_instructions
 
     def get_instructions(self):
         """
         Fetches a set of post-clone instructions from the Air API
+        Uses v2 endpoint for UUIDs required for selective deletion
 
         Returns:
         list - A list of instructions on success, or False if an error occurred
         """
         logging.debug('Getting post-clone instructions')
         identity = self.get_identity()
-        url = self.config['AIR_API']
-        url += f'simulation-node/{identity}/instructions/'
+
         try:
             if not identity:
                 raise Exception('No identity')
-            res = requests.get(url, timeout=10, verify=self.verify_ssl)
-            instructions = res.json()
-            logging.debug(f'Encrypted instructions: {instructions}')
+
+            # Get agent key for V2 API authentication
+            agent_key = self.get_key(identity)
+            if not agent_key:
+                raise Exception('No agent key found')
+
+            # Build V2 URL using urllib.parse for cleaner URL construction
+            base_url = urlparse(self.config['AIR_API'])
+            v2_url = base_url._replace(
+                path=f'/api/v2/simulations/nodes/{identity}/instructions/',
+                query=urlencode(
+                    {'agent_key': agent_key, 'limit': LIMIT}
+                ),  # TODO: Remove limit once NGC refactor is complete
+            ).geturl()
+
+            v2_instructions = []
+            next_url = v2_url
+            while next_url:
+                res = requests.get(next_url, timeout=10, verify=self.verify_ssl)
+                if res.status_code != HTTPStatus.OK:
+                    raise Exception(f'Fail to get instructions from API, status {res.status_code}')
+                response_data = res.json()
+                v2_instructions.extend(response_data.get('results', []))
+                next_url = response_data.get('next')  # server provides full URL
+
+            logging.debug(f'Successfully fetched from v2: {len(v2_instructions)} instructions')
+
+            decrypted_instructions = self.decrypt_instructions(v2_instructions, identity)
+            logging.debug(f'Decrypted v2 instructions: {decrypted_instructions}')
+            return decrypted_instructions
         except:
             logging.error('Failed to get post-clone instructions')
             logging.debug(traceback.format_exc())
             return False
-        instructions = self.decrypt_instructions(instructions, identity)
-        logging.debug(f'Decrypted instructions: {instructions}')
-        return instructions
 
-    def delete_instructions(self):
+    def delete_instructions(self, instruction_ids):
         """
-        Deletes instructions via the Air API. This serves as an indication that the instructions
-        have been successfully executed (i.e. they do not need to be re-tried)
+        Deletes specific instructions via the Air API using their IDs with V2 API bulk-delete endpoint
+        Uses batch deletion to avoid URL length limits
+
+        Arguments:
+        instruction_ids (list) - List of instruction UUIDs to delete
         """
-        logging.debug('Deleting post-clone instructions')
-        url = self.config['AIR_API']
-        url += f'simulation-node/{self.identity}/instructions/'
-        try:
-            requests.delete(url, verify=self.verify_ssl)
-        except:
-            logging.error('Failed to delete post-clone instructions')
-            logging.debug(traceback.format_exc())
+        if not instruction_ids:
+            logging.debug('delete_instructions called with empty list - nothing to delete')
+            return
+
+        logging.debug(f'Deleting specific instructions: {instruction_ids}')
+
+        # Get agent key for V2 API authentication
+        agent_key = self.get_key(self.identity)
+        if not agent_key:
+            logging.error('No agent key found for deletion')
+            return
+
+        # Process deletions in batches to avoid URL length limits
+        successful_deletions = 0
+        failed_deletions = 0
+
+        for batch in batch_list(instruction_ids, BATCH_SIZE):
+            logging.debug(f'Deleting batch of {len(batch)} instructions')
+
+            # Build V2 delete URL using urllib.parse for cleaner URL construction
+            base_url = urlparse(self.config['AIR_API'])
+            delete_url = base_url._replace(
+                path=f'/api/v2/simulations/nodes/{self.identity}/instructions/bulk-delete/',
+                query=urlencode({'ids': ','.join(batch), 'agent_key': agent_key}),
+            ).geturl()
+
+            try:
+                res = requests.delete(delete_url, timeout=10, verify=self.verify_ssl)
+                if res.status_code == HTTPStatus.NO_CONTENT:
+                    successful_deletions += len(batch)
+                    logging.debug(f'Successfully deleted batch of {len(batch)} instructions')
+                else:
+                    failed_deletions += len(batch)
+                    logging.error(f'Failed to delete batch with status {res.status_code}')
+            except Exception as e:
+                failed_deletions += len(batch)
+                logging.error(f'Failed to delete batch: {e}')
+                logging.debug(traceback.format_exc())
+
+        # Log summary
+        if successful_deletions > 0:
+            logging.info(f'Successfully deleted {successful_deletions} instructions')
+        if failed_deletions > 0:
+            logging.warning(f'Failed to delete {failed_deletions} instructions')
 
     def signal_watch(self, attempt=1, test=False):
         """
@@ -393,6 +481,7 @@ def parse_instructions(agent, attempt=1, channel=None, lock=True):
     if lock:
         agent.lock.acquire()
     results = []
+    successful_instruction_ids = []
     backoff = attempt * 10
     instructions = agent.get_instructions()
     if instructions == []:
@@ -410,8 +499,15 @@ def parse_instructions(agent, attempt=1, channel=None, lock=True):
         logging.error('Failed to fetch instructions. Giving up.')
         agent.unlock()
         return False
-    for instruction in instructions:
+
+    logging.info(f'Processing {len(instructions)} instructions')
+
+    for i, instruction in enumerate(instructions):
         executor = instruction['executor']
+        instruction_id = instruction.get('id')
+
+        logging.info(f'Executing instruction {i+1}/{len(instructions)}: {executor} (ID: {instruction_id})')
+
         if executor == 'init' and not agent.os:
             logging.debug('Skipping init instructions due to missing os')
             continue
@@ -421,16 +517,37 @@ def parse_instructions(agent, attempt=1, channel=None, lock=True):
                 target=agent.monitor, args=(channel,), kwargs=json.loads(instruction['monitor'])
             ).start()
         if executor in executors.EXECUTOR_MAP.keys():
-            results.append(executors.EXECUTOR_MAP[executor](instruction['data']))
+            result = executors.EXECUTOR_MAP[executor](instruction['data'])
+            results.append(result)
+
+            # Track successful instructions for selective deletion
+            if result and instruction_id:
+                successful_instruction_ids.append(instruction_id)
+                logging.info(f'Instruction {i+1} (ID: {instruction_id}) executed successfully')
+            elif result and not instruction_id:
+                logging.warning(f'Instruction {i+1} succeeded but no UUID available - will not be deleted')
+            else:
+                logging.warning(f'Instruction {i+1} (ID: {instruction_id}) failed')
         else:
             logging.warning(f'Received unsupported executor {executor}')
         agent.monitoring = False
-    if results and all(results):
-        logging.debug('All instructions executed successfully')
+
+    # Delete successful instructions if any
+    if successful_instruction_ids:
+        logging.info(f'Deleting {len(successful_instruction_ids)} successful instructions')
         agent.identity = agent.get_identity()
-        agent.delete_instructions()
+        agent.delete_instructions(successful_instruction_ids)
+
+    # Check if all instructions succeeded
+    if all(results):
+        logging.debug(
+            'All instructions executed successfully'
+            if results
+            else 'No executable instructions in batch - nothing to do'
+        )
         agent.unlock()
         return True
+
     if results and attempt <= 3:
         logging.warning(
             f'Failed to execute all instructions on attempt #{attempt}. '
