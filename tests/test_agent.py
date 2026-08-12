@@ -724,14 +724,8 @@ class TestBatchList(TestCase):
 
 
 class TestAgentFunctions(TestCase):
-    class MockConfigParser(dict):
-        def __init__(self):
-            super().__init__()
-            self.read = MagicMock()
-
     def setUp(self):
         self.config = util.load_config()
-        self.mock_parse = self.MockConfigParser()
 
     @patch('argparse.ArgumentParser')
     def test_parse_args(self, mock_argparse):
