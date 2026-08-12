@@ -405,7 +405,7 @@ class Agent:
             return
         logging.info('Checking for updates')
         try:
-            res = requests.get(self.config['VERSION_URL'])
+            res = requests.get(self.config['VERSION_URL'], verify=self.verify_ssl, timeout=10)
             # pylint: disable=invalid-string-quote
             latest = res.text.split(' = ')[1].strip().strip("'")
             if AGENT_VERSION != latest:
