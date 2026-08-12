@@ -225,11 +225,13 @@ class TestAgent(TestCase):
         self.assertEqual(res, False)
         mock_log.assert_called_with('Failed to get post-clone instructions')
 
+    @patch('requests.get')
     @patch('agent.Agent.get_identity', return_value=False)
-    @patch('builtins.Exception')
-    def test_get_instructions_no_identity(self, mock_exception, mock_identity):
-        self.agent.get_instructions()
-        mock_exception.assert_called_with('No identity')
+    def test_get_instructions_no_identity(self, mock_identity, mock_get):
+        with self.assertRaises(Exception) as ctx:
+            self.agent.get_instructions()
+        self.assertEqual(str(ctx.exception), 'No identity')
+        mock_get.assert_not_called()
 
     @patch('requests.delete')
     @patch('logging.info')
