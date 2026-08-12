@@ -9,7 +9,7 @@ readme = "README.md"
 
 [tool.poetry.dependencies]
 python = "^3.8"
-certifi = "2024.8.30"
+certifi = ">=2024.8.30"  # CA bundle: allow latest updates; no semver/API risk
 cryptography = "^43.0.3"
 gitpython = "^3.1.44"
 requests = "^2.32.3"
