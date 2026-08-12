@@ -408,10 +408,10 @@ class TestAgent(TestCase):
         mock_log.assert_called_with('Something went wrong. Syncing clock to be safe...')
 
     @patch('subprocess.check_output', return_value=b'foo')
-    @patch('builtins.Exception')
-    def test_clock_jumped_raised(self, mock_exception, mock_sub):
-        self.agent.clock_jumped()
-        mock_exception.assert_called_with('Unable to parse hardware clock')
+    def test_clock_jumped_raised(self, mock_sub):
+        with self.assertRaises(Exception) as ctx:
+            self.agent.clock_jumped()
+        self.assertEqual(str(ctx.exception), 'Unable to parse hardware clock')
 
     @patch('subprocess.check_output', return_value=b'hwclock from util-linux 2.34.2')
     def test_set_hwclock_switch_new(self, mock_output):
