@@ -664,11 +664,9 @@ def check_devices(config):
     if not mount_device(config):
         return False
     try:
-        subprocess.run(f'ls {key_dir / "uuid*"}', shell=True)
-    except:
-        logging.info(f'Failed to find expected files on {device} filesystem - agent will not be started')
-        logging.debug(traceback.format_exc())
-        return False
+        if not list(key_dir.glob('uuid*.txt')):
+            logging.info(f'Failed to find expected files on {device} filesystem - agent will not be started')
+            return False
 
     return True
 
@@ -695,9 +693,19 @@ def mount_device(config):
         except subprocess.CalledProcessError:
             logging.debug(f'{key_dir} exists but is not mounted')
     try:
-        subprocess.run(f'mount {device} {key_dir} 2>/dev/null', shell=True)
-    except:
-        logging.error(f'Failed to mount {device} to {key_dir}')
+        subprocess.run(
+            ['mount', str(device), str(key_dir)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as e:
+        stderr = (e.stderr or '').strip()
+        logging.error(f'Failed to mount {device} to {key_dir}: {stderr}')
+        logging.debug(traceback.format_exc())
+        return False
+    except OSError:
+        logging.error(f'Failed to run mount command for {device} to {key_dir}')
         logging.debug(traceback.format_exc())
         return False
 
