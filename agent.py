@@ -360,6 +360,9 @@ class Agent:
         if not filename:
             return
         pattern = kwargs.get('pattern')
+        if pattern is None:
+            logging.warning('Monitor pattern missing, skipping')
+            return
         logging.info(f'Starting monitor for {filename}')
         while self.monitoring and not os.path.exists(filename):
             time.sleep(1)
