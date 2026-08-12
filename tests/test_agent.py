@@ -1171,15 +1171,17 @@ class TestAgentFunctions(TestCase):
             self.assertEqual(return_value, Path('/dev/test2'))
 
     def test_get_key_device_path_command_errors(self):
-        for exception in (subprocess.CalledProcessError, Exception):
+        for exception in (subprocess.CalledProcessError(1, 'blkid'), Exception('mock error')):
             with self.subTest(exception=exception), patch.object(
-                subprocess, subprocess.run.__name__, return_value=exception
+                subprocess, subprocess.run.__name__, side_effect=exception
             ):
                 return_value = agent.get_key_device_path(self.config)
                 self.assertEqual(return_value, Path('/dev/test'))
 
     def test_get_key_device_path_fallback(self):
-        with patch.object(subprocess, subprocess.run.__name__, return_value=Exception):
+        with patch.object(
+            subprocess, subprocess.run.__name__, side_effect=Exception('mock error')
+        ):
             del self.config['KEY_DEVICE']
             return_value = agent.get_key_device_path(self.config)
             self.assertEqual(return_value, Path('/dev/vdb'))
